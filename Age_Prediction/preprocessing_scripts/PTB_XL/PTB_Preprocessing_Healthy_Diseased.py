@@ -80,7 +80,7 @@ def preprocess_ecg(signal, fs=500):
 #                                  DATA LOAD                                    #
 ################################################################################
 
-path = '/data/BCS/Services/Ronika_De/ImageDS/PTB/physionet.org/files/ptb-xl/1.0.3/'
+path = '/data/BCS/Services/David_Leone/ACHA-2025/raw_data/PTB_XL/PTB/physionet.org/files/ptb-xl/1.0.3/'
 sampling_rate=500 # 500Hz records
 
 Y = pd.read_csv(path + "ptbxl_database.csv", index_col="ecg_id")
@@ -155,7 +155,8 @@ assert len(groups) == len(X), "Group assignment mismatch!"
 print("Segment-level healthy:", is_healthy_seg.sum())
 print("Segment-level diseased:", is_diseased_seg.sum())
 
-cache_dir = os.path.join(path, "cache")
+cache_path = "/data/BCS/Services/David_Leone/ACHA-2025/raw_data/PTB_XL/"
+cache_dir = os.path.join(cache_path, "cache")
 os.makedirs(cache_dir, exist_ok=True)
 
 cached_file = os.path.join(cache_dir, "ptbxl_ecg_segments.npz")

@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from sklearn.model_selection import GroupShuffleSplit
 
-BASE_DIR = "/data/BCS/Services/Ronika_De/ImageDS/MIMIC_IV/segments_fast"
+BASE_DIR = "/data/BCS/Services/David_Leone/ACHA-2025/raw_data/MIMIC_IV/segments_fast"
 
 node_dirs = sorted(glob.glob(os.path.join(BASE_DIR, "node_*")))
 assert len(node_dirs) > 0, "No node directories found!"

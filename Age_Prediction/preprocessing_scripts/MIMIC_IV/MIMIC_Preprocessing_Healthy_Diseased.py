@@ -19,7 +19,7 @@ N_JOBS = 28                      # must match BSUB -n
 SEG_LEN = 5000
 FS = 500
 
-OUT_DIR = f"/data/BCS/Services/Ronika_De/ImageDS/MIMIC_IV/segments_fast/node_{NODE_ID}"
+OUT_DIR = f"/data/BCS/Services/David_Leone/ACHA-2025/raw_data/MIMIC_IV/segments_fast/node_{NODE_ID}"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 ################################################################################
@@ -71,14 +71,8 @@ def preprocess_one(record_path):
 ################################################################################
 #                        LOAD & PREPARE METADATA                                #
 ################################################################################
-CSV_PATH = (
-    "/data/BCS/Services/Ronika_De/ImageDS/MIMIC_IV/"
-    "physionet.org/files/mimic-iv-ecg/1.0/records_w_diag_icd10.csv"
-)
-BASE_PATH = (
-    "/data/BCS/Services/Ronika_De/ImageDS/MIMIC_IV/"
-    "physionet.org/files/mimic-iv-ecg/1.0"
-)
+CSV_PATH = ("/data/BCS/Services/David_Leone/ACHA-2025/raw_data/MIMIC_IV/records_w_diag_icd10.csv")
+BASE_PATH = ("/data/BCS/Services/David_Leone/ACHA-2025/raw_data/MIMIC_IV/physionet.org/physionet.org/files/mimic-iv-ecg/1.0")
 
 df = pd.read_csv(CSV_PATH)
 
