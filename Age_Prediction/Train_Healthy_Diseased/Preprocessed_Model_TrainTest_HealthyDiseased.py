@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch.utils.data import TensorDataset, Subset
 
 from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
@@ -30,6 +31,7 @@ from fastai.metrics import mae
 from fastai.data.core import DataLoaders
 from fastai.learner import Learner
 from fastai.callback.core import Callback
+from fastai.callback.fp16 import MixedPrecision
 from fastai.callback.schedule import fit_one_cycle
 from fastai.callback.training import GradientClip
 from fastai.callback.tracker import EarlyStoppingCallback, SaveModelCallback
@@ -59,8 +61,8 @@ MAX_AGE = 89
 AGE_BINS = np.arange(18, 95, 5)  # for sex ratio plots
 MISSING_SEX_CODE = -1            # 0=male, 1=female, -1=unknown
 
-DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE, TEST_BS, EPOCHS, LR = 128, 128, 50, 1e-2
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE, TEST_BS, EPOCHS, LR = 256, 256, 50, 1e-2
 age_bins = np.arange(18, 95, 5)
 
 NUM_CHANNELS = 12
@@ -93,18 +95,19 @@ def make_sex_tensor(values,
     return torch.from_numpy(out)
 
 def ensure_channel_first_torch(X: torch.Tensor) -> torch.FloatTensor:
-    """
-    Ensure X is float torch tensor with shape (N, C, T). If input is (N, T, C), permute.
-    """
     if not isinstance(X, torch.Tensor):
         X = torch.from_numpy(X)
     X = X.float()
     if X.ndim != 3:
         raise ValueError(f"Expected 3D tensor (N,*,*); got shape {tuple(X.shape)}")
     N, A, B = X.shape
-    if B > A:  # (N, T, C) -> (N, C, T)
-        X = X.permute(0, 2, 1)
-    return X
+    # ECG channels are always small (<= 32)
+    if A <= 32 and B > A:
+        return X  # already (N, C, T)
+    elif B <= 32 and A > B:
+        return X.permute(0, 2, 1)  # (N, T, C) → (N, C, T)
+    else:
+        raise ValueError(f"Cannot infer channel dimension from shape {X.shape}")
 
 def safe_np_save(path: str, arr: np.ndarray):
     """
@@ -335,6 +338,7 @@ m, f = sex_counts_by_bin(yh_age_torch_ptbxl.cpu().numpy(), sex_h_torch_ptbxl.cpu
 plot_sex_ratio(m, f, "PTB-XL Healthy — Sex by Age", "ptbxl_healthy_sex_age.pdf")
 m, f = sex_counts_by_bin(yd_age_torch_ptbxl.cpu().numpy(), sex_d_torch_ptbxl.cpu().numpy())
 plot_sex_ratio(m, f, "PTB-XL Diseased — Sex by Age", "ptbxl_diseased_sex_age.pdf")
+
 
 # ============================================================
 # EchoNext (IN-MEMORY)
@@ -641,9 +645,7 @@ class MIMICNPYDataset(Dataset):
     Streaming dataset over chunked MIMIC .npy files.
     Each sample: dict with X (C,T), age, pid, sex, label.
     """
-
     def __init__(self, base_dir, split: str):
-
         assert split in ("healthy", "diseased")
         self.base_dir = base_dir
         self.split = split
@@ -666,32 +668,26 @@ class MIMICNPYDataset(Dataset):
         self.pid_files = sorted(glob.glob(pid_glob))
         self.sex_files = sorted(glob.glob(sex_glob))
 
-        assert len(self.X_files) == len(self.y_files) == len(self.pid_files) == len(self.sex_files)
+        # =================================================
+        # Memory-mapped / preloaded tensors
+        # =================================================
+        self.X_memmaps   = [torch.from_numpy(np.load(f, mmap_mode="r")) for f in self.X_files]
+        self.y_memmaps   = [torch.from_numpy(np.load(f, mmap_mode="r")) for f in self.y_files]
+        self.pid_memmaps = [torch.from_numpy(np.load(f, mmap_mode="r")) for f in self.pid_files]
+        self.sex_memmaps = [torch.from_numpy(np.load(f, mmap_mode="r")) for f in self.sex_files]
 
-        # ------------------------------------------------
-        # MEMORY MAP FILES ONCE
-        # ------------------------------------------------
-
-        self.X_memmaps   = [np.load(f, mmap_mode="r") for f in self.X_files]
-        self.y_memmaps   = [np.load(f, mmap_mode="r") for f in self.y_files]
-        self.pid_memmaps = [np.load(f, mmap_mode="r") for f in self.pid_files]
-        self.sex_memmaps = [np.load(f, mmap_mode="r") for f in self.sex_files]
-
-        # ------------------------------------------------
-        # BUILD GLOBAL INDEX
-        # ------------------------------------------------
-
+        # Build global index: (file_idx, local_idx)
         self.index = []
-
-        for fi, x_mm in enumerate(self.X_memmaps):
+        for fi, x_path in enumerate(self.X_files):
+            x_mm = np.load(x_path, mmap_mode="r")
             n = x_mm.shape[0]
             self.index.extend([(fi, i) for i in range(n)])
+            del x_mm
 
     def __len__(self):
         return len(self.index)
 
     def __getitem__(self, idx):
-
         fi, li = self.index[idx]
 
         X   = self.X_memmaps[fi][li]
@@ -699,19 +695,11 @@ class MIMICNPYDataset(Dataset):
         pid = self.pid_memmaps[fi][li]
         sex = self.sex_memmaps[fi][li]
 
-        X = torch.from_numpy(X).float()
+        X = ensure_channel_first_torch(X.unsqueeze(0)).squeeze(0)
+        age = age.float()
+        label = torch.tensor(self.label_value, dtype=torch.long)
 
-        if X.shape[0] != 12:
-            X = X.permute(1,0)
-
-        return {
-            "X": X,
-            "age": torch.tensor(age, dtype=torch.float32),
-            "pid": torch.tensor(pid, dtype=torch.long),
-            "sex": torch.tensor(sex, dtype=torch.long),
-            "label": torch.tensor(self.label_value, dtype=torch.long)
-        }
-
+        return {"X": X, "age": age, "pid": pid, "sex": sex, "label": label}
 
 class InMemoryECGDataset(Dataset):
     """
@@ -736,23 +724,26 @@ class InMemoryECGDataset(Dataset):
         return {"X": X, "age": age, "pid": pid, "sex": sex, "label": label}
 
 # Build datasets
-ptbxl_healthy_ds = InMemoryECGDataset(
-    Xw_h_torch_ptbxl, yh_age_torch_ptbxl, pid_h_torch_ptbxl, sex_h_torch_ptbxl, label_value=0
-)
-ptbxl_diseased_ds = InMemoryECGDataset(
-    Xw_d_torch_ptbxl, yd_age_torch_ptbxl, pid_d_torch_ptbxl, sex_d_torch_ptbxl, label_value=1
-)
+ptbxl_healthy_ds = InMemoryECGDataset(Xw_h_torch_ptbxl, yh_age_torch_ptbxl, pid_h_torch_ptbxl, sex_h_torch_ptbxl, label_value=0)
+ptbxl_diseased_ds = InMemoryECGDataset(Xw_d_torch_ptbxl, yd_age_torch_ptbxl, pid_d_torch_ptbxl, sex_d_torch_ptbxl, label_value=1)
 
-echonext_healthy_ds = InMemoryECGDataset(
-    Xw_h_torch_echonext, yh_age_torch_echonext, pid_h_torch_echonext, sex_h_torch_echonext, label_value=0
-)
-echonext_diseased_ds = InMemoryECGDataset(
-    Xw_d_torch_echonext, yd_age_torch_echonext, pid_d_torch_echonext, sex_d_torch_echonext, label_value=1
-)
+echonext_healthy_ds = InMemoryECGDataset(Xw_h_torch_echonext, yh_age_torch_echonext, pid_h_torch_echonext, sex_h_torch_echonext, label_value=0)
+echonext_diseased_ds = InMemoryECGDataset(Xw_d_torch_echonext, yd_age_torch_echonext, pid_d_torch_echonext, sex_d_torch_echonext, label_value=1)
 
 mimic_healthy_ds = MIMICNPYDataset(OUT_DIR_mimic, split="healthy")
 mimic_diseased_ds = MIMICNPYDataset(OUT_DIR_mimic, split="diseased")
 
+# Combined dataset (all sources)
+train_ds = ConcatDataset([ptbxl_healthy_ds, ptbxl_diseased_ds, echonext_healthy_ds, echonext_diseased_ds, mimic_healthy_ds, mimic_diseased_ds])
+
+train_loader = DataLoader(
+    train_ds,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=35,
+    pin_memory=True,
+    persistent_workers=True,
+)
 
 # ============================================================
 # SANITY SUMMARY
@@ -800,7 +791,6 @@ def mse_flat(pred, targ):
 
 class AgeRegWrapper(Dataset):
     """Wraps any dataset returning dict → tuple (X, age)."""
-
     def __init__(self, base: Dataset):
         self.base = base
 
@@ -809,15 +799,8 @@ class AgeRegWrapper(Dataset):
 
     def __getitem__(self, idx):
         d = self.base[idx]
-        x = d["X"]
-        y = d["age"]
-        # Convert to tensor
-        x = torch.tensor(x, dtype=torch.float32)
-        y = torch.tensor(y, dtype=torch.float32)
-        # Fix channel order if needed
-        if x.ndim == 2 and x.shape[0] != 12:
-            x = x.permute(1, 0)   # (5000,12) -> (12,5000)
-        return x, y
+        return d["X"], d["age"]
+
 
 def build_concat_from_sources(sources, split):
     """
@@ -941,21 +924,12 @@ def iter_indices_for_patients(concat_ds, subdatasets, train_patients, val_patien
 
         elif isinstance(sub, MIMICNPYDataset):
             pos = 0
-            pid_cache = {}
-
             for fi, li in sub.index:
-
-                # Load each PID file only once
-                if fi not in pid_cache:
-                    pid_cache[fi] = np.load(sub.pid_files[fi], mmap_mode="r")
-
-                pid = int(pid_cache[fi][li])
-
+                pid = int(np.load(sub.pid_files[fi], mmap_mode="r")[li])
                 if pid in train_patients:
                     tr_inds.append(offset + pos)
                 elif pid in val_patients:
                     va_inds.append(offset + pos)
-
                 pos += 1
 
         offset += n
@@ -1049,48 +1023,6 @@ def plot_segment_mean_age(df, model_name, dataset_name=None, save_dir="./plots",
     plt.close()
 
 
-def plot_age_group_heatmap_from_bins(y_true, y_pred, age_bins, model_name, save_path):
-    """
-    Reproduces Fig 3b using the SAME age bins used for stratified sampling.
-    Rows = actual age bins
-    Columns = predicted age bins
-    Values = percentage of patients in each actual bin whose predicted age falls in each predicted bin.
-    """
-
-    import seaborn as sns
-    import matplotlib.pyplot as plt
-
-    # Convert bins to labels like "18–22", "23–27", etc.
-    labels = []
-    for i in range(len(age_bins)-1):
-        labels.append(f"{age_bins[i]}–{age_bins[i] + 4}")
-    labels[-1] = f"{age_bins[-2]}+"   # last bin becomes "83+" style
-
-    # Bin true and predicted ages
-    true_bins = pd.cut(y_true, bins=age_bins, labels=labels, right=False)
-    pred_bins = pd.cut(y_pred, bins=age_bins, labels=labels, right=False)
-
-    # Confusion matrix as percentages
-    cm = pd.crosstab(true_bins, pred_bins, normalize='index') * 100
-
-    # Plot heatmap
-    plt.figure(figsize=(8,6))
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt=".1f",
-        cmap="Blues",
-        cbar_kws={'label': 'Percentage (%)'}
-    )
-
-    plt.xlabel("Predicted Age")
-    plt.ylabel("True Age")
-    plt.title(f"{model_name} — Age Estimation")
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
-    plt.close()
-
-
 # ============================================================
 # ====================== FULL CV PIPELINE ====================
 # ============================================================
@@ -1099,69 +1031,104 @@ def run_full_experiment(
     train_sources,
     model_fn,
     n_splits=10,
+    test_size=0.10,
     epochs=EPOCHS,
     bs=BATCH_SIZE,
     test_bs=TEST_BS,
     results_dir="./results",
     run_name="experiment",
 ):
-
     os.makedirs(results_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(results_dir, f"{run_name}_{timestamp}")
     os.makedirs(out_dir, exist_ok=True)
 
     # ==========================================================
-    # 1️⃣ BUILD DATASETS
+    # 1️⃣ BUILD HEALTHY + DISEASED DATASETS
     # ==========================================================
     healthy_concat, healthy_subs, _ = build_concat_from_sources(train_sources, "healthy")
     diseased_concat, diseased_subs, _ = build_concat_from_sources(train_sources, "diseased")
 
+    full_subs = healthy_subs + diseased_subs
+    full_concat = ConcatDataset(full_subs)
+
     # ==========================================================
-    # 2️⃣ HEALTHY PATIENT → AGE TABLE
+    # 2️⃣ PATIENT → AGE TABLE
     # ==========================================================
     healthy_age = patient_agg_from_concat(healthy_subs, agg="mean")
+    diseased_age = patient_agg_from_concat(diseased_subs, agg="mean")
 
-    df_h = pd.DataFrame({
-        "patient_id": list(healthy_age.keys()),
-        "age": list(healthy_age.values())
-    })
+    df_h = pd.DataFrame({"patient_id": list(healthy_age.keys()),
+                         "age": list(healthy_age.values())})
+    df_d = pd.DataFrame({"patient_id": list(diseased_age.keys()),
+                         "age": list(diseased_age.values())})
 
     df_h["age_bin"] = np.digitize(df_h["age"], AGE_BINS) - 1
-
-    print(f"Total healthy patients: {len(df_h)}")
+    df_d["age_bin"] = np.digitize(df_d["age"], AGE_BINS) - 1
 
     # ==========================================================
-    # 3️⃣ 10-FOLD STRATIFIED CV
+    # 3️⃣ STRATIFIED HOLD-OUT SPLITS (SEPARATE)
     # ==========================================================
-    skf = StratifiedKFold(
-        n_splits=n_splits,
-        shuffle=True,
-        random_state=SEED
+    def stratified_split(df):
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=SEED)
+        dummy = np.zeros(len(df))
+        tr_idx, ho_idx = next(sss.split(dummy, df["age_bin"]))
+        return (
+            set(df.iloc[tr_idx]["patient_id"]),
+            set(df.iloc[ho_idx]["patient_id"])
+        )
+
+    healthy_train_pats, healthy_holdout_pats = stratified_split(df_h)
+    diseased_train_pats, diseased_holdout_pats = stratified_split(df_d)
+
+    train_patients = healthy_train_pats.union(diseased_train_pats)
+
+    # Convert to segment indices
+    train_inds, _ = iter_indices_for_patients(full_concat, full_subs, train_patients, set())
+    healthy_hold_inds, _ = iter_indices_for_patients(
+        healthy_concat, healthy_subs, healthy_holdout_pats, set()
     )
+    diseased_hold_inds, _ = iter_indices_for_patients(
+        diseased_concat, diseased_subs, diseased_holdout_pats, set()
+    )
+
+    train_concat = Subset(full_concat, train_inds)
+    healthy_holdout = Subset(healthy_concat, healthy_hold_inds)
+    diseased_holdout = Subset(diseased_concat, diseased_hold_inds)
+
+    print(f"Train segments: {len(train_concat)}")
+    print(f"Healthy hold-out segments: {len(healthy_holdout)}")
+    print(f"Diseased hold-out segments: {len(diseased_holdout)}")
+
+    # ==========================================================
+    # 4️⃣ 10-FOLD CV
+    # ==========================================================
+    df_train_pat = pd.concat([
+        df_h[df_h["patient_id"].isin(healthy_train_pats)],
+        df_d[df_d["patient_id"].isin(diseased_train_pats)]
+    ]).reset_index(drop=True)
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
 
     fold_models = []
     cv_rows = []
 
-    dummy = np.zeros(len(df_h))
+    dummy = np.zeros(len(df_train_pat))
 
     for fold_idx, (tr_idx, va_idx) in enumerate(
-        skf.split(dummy, df_h["age_bin"])
+        skf.split(dummy, df_train_pat["age_bin"])
     ):
-        print(f"\n========== Fold {fold_idx+1}/{n_splits} ==========")
+        print(f"\n==== Fold {fold_idx} ====")
 
-        tr_pats = set(df_h.iloc[tr_idx]["patient_id"])
-        va_pats = set(df_h.iloc[va_idx]["patient_id"])
+        tr_pats = set(df_train_pat.iloc[tr_idx]["patient_id"])
+        va_pats = set(df_train_pat.iloc[va_idx]["patient_id"])
 
         tr_inds, va_inds = iter_indices_for_patients(
-            healthy_concat,
-            healthy_subs,
-            tr_pats,
-            va_pats
+            full_concat, full_subs, tr_pats, va_pats
         )
 
-        tr_ds = AgeRegWrapper(Subset(healthy_concat, tr_inds))
-        va_ds = AgeRegWrapper(Subset(healthy_concat, va_inds))
+        tr_ds = AgeRegWrapper(Subset(full_concat, tr_inds))
+        va_ds = AgeRegWrapper(Subset(full_concat, va_inds))
 
         dls = DataLoaders.from_dsets(
             tr_ds, va_ds,
@@ -1194,8 +1161,6 @@ def run_full_experiment(
             preds.cpu().numpy().flatten()
         )
 
-        print("Fold metrics:", val_metrics)
-
         cv_rows.append({
             "fold": fold_idx,
             "val_mae": val_metrics[0],
@@ -1211,20 +1176,12 @@ def run_full_experiment(
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
-    # ==========================================================
-    # 4️⃣ MEAN 10-FOLD CV METRICS
-    # ==========================================================
     df_cv = pd.DataFrame(cv_rows)
-    mean_cv = df_cv.mean(numeric_only=True)
-
-    print("\n===== Mean 10-Fold CV Metrics =====")
-    print(mean_cv)
+    df_cv.to_csv(os.path.join(out_dir, "cv_fold_metrics.csv"), index=False)
 
     # ==========================================================
-    # 5️⃣ CV ENSEMBLE METRICS (ON FULL HEALTHY SET)
+    # 5️⃣ HOLD-OUT PREDICTIONS (ALL FOLDS)
     # ==========================================================
-    print("\nComputing 10-fold CV Ensemble metrics (Healthy)...")
-
     def predict_stack(ds):
         dl = DataLoader(AgeRegWrapper(ds), batch_size=test_bs, shuffle=False)
         stack = []
@@ -1240,81 +1197,90 @@ def run_full_experiment(
 
         return np.vstack(stack)
 
-    healthy_full_ds = Subset(
-        healthy_concat,
-        list(range(len(healthy_concat)))
-    )
+    healthy_stack = predict_stack(healthy_holdout)
+    diseased_stack = predict_stack(diseased_holdout)
 
-    healthy_stack = predict_stack(healthy_full_ds)
-    healthy_ensemble = healthy_stack.mean(axis=0)
+    healthy_true = np.array([d["age"].item() for d in healthy_holdout])
+    diseased_true = np.array([d["age"].item() for d in diseased_holdout])
 
-    healthy_true = np.array([d["age"].item() for d in healthy_full_ds])
+    # Fold-wise hold-out metrics
+    healthy_fold_metrics = [
+        regression_metrics(healthy_true, healthy_stack[i])
+        for i in range(n_splits)
+    ]
 
-    healthy_ensemble_metrics = regression_metrics(
-        healthy_true,
-        healthy_ensemble
-    )
+    diseased_fold_metrics = [
+        regression_metrics(diseased_true, diseased_stack[i])
+        for i in range(n_splits)
+    ]
 
-    print("\n===== Healthy 10-Fold CV Ensemble Metrics =====")
-    print(healthy_ensemble_metrics)
+    # SAVE HOLD-OUT CV METRICS
+    healthy_rows = []
+    diseased_rows = []
+
+    for i in range(n_splits):
+        h_mae, h_bias, h_rmse, h_r2 = healthy_fold_metrics[i]
+        d_mae, d_bias, d_rmse, d_r2 = diseased_fold_metrics[i]
+
+        healthy_rows.append({
+            "fold": i,
+            "MAE": h_mae,
+            "BIAS": h_bias,
+            "RMSE": h_rmse,
+            "R2": h_r2
+        })
+
+        diseased_rows.append({
+            "fold": i,
+            "MAE": d_mae,
+            "BIAS": d_bias,
+            "RMSE": d_rmse,
+            "R2": d_r2
+        })
+
+    df_healthy_cv = pd.DataFrame(healthy_rows)
+    df_diseased_cv = pd.DataFrame(diseased_rows)
+
+    df_healthy_cv.to_csv(os.path.join(out_dir, "healthy_holdout_cv_metrics.csv"), index=False)
+    df_diseased_cv.to_csv(os.path.join(out_dir, "diseased_holdout_cv_metrics.csv"), index=False)
 
     # ==========================================================
-    # 6️⃣ DISEASED ENSEMBLE METRICS
+    # 6️⃣ ENSEMBLE METRICS
     # ==========================================================
-    diseased_age = patient_agg_from_concat(diseased_subs, agg="mean")
+    healthy_ens = healthy_stack.mean(axis=0)
+    diseased_ens = diseased_stack.mean(axis=0)
 
-    diseased_inds, _ = iter_indices_for_patients(
-        diseased_concat,
-        diseased_subs,
-        set(diseased_age.keys()),
-        set()
-    )
+    healthy_metrics = regression_metrics(healthy_true, healthy_ens)
+    diseased_metrics = regression_metrics(diseased_true, diseased_ens)
 
-    diseased_full = Subset(diseased_concat, diseased_inds)
-
-    diseased_stack = predict_stack(diseased_full)
-    diseased_ensemble = diseased_stack.mean(axis=0)
-
-    diseased_true = np.array([d["age"].item() for d in diseased_full])
-
-    diseased_metrics = regression_metrics(
-        diseased_true,
-        diseased_ensemble
-    )
-
-    print("\n===== Diseased Ensemble Metrics =====")
-    print(diseased_metrics)
-
-    # ==========================================================
-    # SAVE EVERYTHING
-    # ==========================================================
-    df_cv.to_csv(os.path.join(out_dir, "cv_fold_metrics.csv"), index=False)
-    pd.DataFrame([mean_cv]).to_csv(os.path.join(out_dir, "cv_mean_metrics.csv"), index=False)
-
-    pd.DataFrame([healthy_ensemble_metrics],
-        columns=["MAE", "BIAS", "RMSE", "R2"]
-    ).to_csv(os.path.join(out_dir, "healthy_cv_ensemble_metrics.csv"), index=False)
+    # Save ensemble metrics
+    pd.DataFrame([healthy_metrics],
+        columns=["MAE","BIAS","RMSE","R2"]
+    ).to_csv(os.path.join(out_dir, "healthy_holdout_ensemble.csv"), index=False)
 
     pd.DataFrame([diseased_metrics],
-        columns=["MAE", "BIAS", "RMSE", "R2"]
-    ).to_csv(os.path.join(out_dir, "diseased_ensemble_metrics.csv"), index=False)
+        columns=["MAE","BIAS","RMSE","R2"]
+    ).to_csv(os.path.join(out_dir, "diseased_holdout_ensemble.csv"), index=False)
+
+    print("\nHealthy Ensemble:", healthy_metrics)
+    print("Diseased Ensemble:", diseased_metrics)
 
     return {
         "cv_results": df_cv,
-        "cv_mean": mean_cv,
-        "healthy_cv_ensemble_metrics": healthy_ensemble_metrics,
-        "diseased_metrics": diseased_metrics,
+        "healthy_holdout_cv": df_healthy_cv,
+        "diseased_holdout_cv": df_diseased_cv,
+        "healthy_holdout_metrics": healthy_metrics,
+        "diseased_holdout_metrics": diseased_metrics,
         "healthy_true": healthy_true,
-        "healthy_ensemble": healthy_ensemble,
         "diseased_true": diseased_true,
-        "diseased_ensemble": diseased_ensemble,
+        "healthy_ensemble": healthy_ens,
+        "diseased_ensemble": diseased_ens
     }
 
 
 # =====================================================================
 # ================================ RUN ================================
 # =====================================================================
-
 # MODEL ZOO
 MODELS = {
     "XResNet1d18": lambda: xresnet1d18(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
@@ -1331,120 +1297,47 @@ MODELS = {
     "Inception1d_Residual": lambda: inception1d(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
 }
 
-
 if __name__ == "__main__":
-
-    # ---------------------------------------------------------
-    # Choose model
-    # ---------------------------------------------------------
-    MODEL_NAME = "XResNet1d50_Deeper"
-
-    print(f"\nRunning Healthy-Only 10-Fold CV with {MODEL_NAME}\n")
+    print("CUDA available:", torch.cuda.is_available())
+    print("CUDA device count:", torch.cuda.device_count())
+    print("CUDA version:", torch.version.cuda)
+    print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")
 
     out = run_full_experiment(
-        train_sources=["PTBXL", "ECHONEXT", "MIMIC"],
-        model_fn=MODELS[MODEL_NAME],
-        n_splits=10,
-        run_name=f"HealthyOnly_10Fold_{MODEL_NAME}"
+        train_sources=["PTBXL" , "ECHONEXT", "MIMIC"],
+        model_fn=MODELS["XResNet1d50_Deeper"],
+        run_name="XResNet1d50_Deeper_Combined"
     )
 
-    # ---------------------------------------------------------
-    # Print Results
-    # ---------------------------------------------------------
-    print("\n================ FINAL RESULTS ================\n")
+    print("\nCV Results:")
+    print(out["cv_results"])
 
-    print("Mean 10-Fold CV Metrics (Healthy Only):")
-    print(out["cv_mean"])
+    print("\nHealthy Hold-Out Metrics:")
+    print(out["healthy_holdout_metrics"])
 
-    print("\n10-Fold CV Ensemble Metrics (Healthy):")
-    print({
-        "MAE":  out["healthy_cv_ensemble_metrics"][0],
-        "BIAS": out["healthy_cv_ensemble_metrics"][1],
-        "RMSE": out["healthy_cv_ensemble_metrics"][2],
-        "R2":   out["healthy_cv_ensemble_metrics"][3],
-    })
+    print("\nDiseased Hold-Out Metrics:")
+    print(out["diseased_holdout_metrics"])
 
-    print("\nDiseased Ensemble Metrics (Healthy-Trained Model):")
-    print({
-        "MAE":  out["diseased_metrics"][0],
-        "BIAS": out["diseased_metrics"][1],
-        "RMSE": out["diseased_metrics"][2],
-        "R2":   out["diseased_metrics"][3],
-    })
-
-    print("\n===============================================")
-    
-    # ---------------------------------------------------------
-    # PLOTTING
-    # ---------------------------------------------------------
-    os.makedirs("./plots/healthy", exist_ok=True)
-    os.makedirs("./plots/diseased", exist_ok=True)
-
-    # -------------------------
-    # Healthy 10-Fold CV Ensemble
-    # -------------------------
+    # Plot for Healthy hold-out
     df_healthy = pd.DataFrame({
         "age": out["healthy_true"],
         "y_pred_mean": out["healthy_ensemble"],
         "dataset": "Healthy"
     })
 
-    plot_segment_mean_age(
-        df_healthy,
-        model_name=MODEL_NAME,
-        dataset_name=None,
-        save_dir="./plots/healthy",
-        CI=None
-    )
+    os.makedirs("./plots/healthy", exist_ok=True)
+    os.makedirs("./plots/diseased", exist_ok=True)
 
-    plot_segment_mean_age(
-        df_healthy,
-        model_name=MODEL_NAME,
-        dataset_name=None,
-        save_dir="./plots/healthy",
-        CI=95
-    )
+    plot_segment_mean_age(df_healthy, model_name="XResNet1d50_Deeper", dataset_name=None, save_dir="./plots/healthy", CI=None)
+    plot_segment_mean_age(df_healthy, model_name="XResNet1d50_Deeper", dataset_name=None, save_dir="./plots/healthy", CI=95)
 
-    plot_age_group_heatmap_from_bins(
-        y_true=out["healthy_true"],
-        y_pred=out["healthy_ensemble"],
-        age_bins=AGE_BINS,
-        model_name=MODEL_NAME,
-        save_path="./plots/healthy/Healthy_Group.png"
-    )
-
-
-    # -------------------------
-    # Diseased Ensemble (Healthy-trained model)
-    # -------------------------
+    # Plot for Healthy hold-out
     df_diseased = pd.DataFrame({
         "age": out["diseased_true"],
         "y_pred_mean": out["diseased_ensemble"],
         "dataset": "Diseased"
     })
 
-    plot_segment_mean_age(
-        df_diseased,
-        model_name=MODEL_NAME,
-        dataset_name=None,
-        save_dir="./plots/diseased",
-        CI=None
-    )
+    plot_segment_mean_age(df_diseased, model_name="XResNet1d50_Deeper", dataset_name=None, save_dir="./plots/diseased", CI=None)
+    plot_segment_mean_age(df_diseased, model_name="XResNet1d50_Deeper", dataset_name=None, save_dir="./plots/diseased", CI=95)
 
-    plot_segment_mean_age(
-        df_diseased,
-        model_name=MODEL_NAME,
-        dataset_name=None,
-        save_dir="./plots/diseased",
-        CI=95
-    )
-
-    plot_age_group_heatmap_from_bins(
-        y_true=out["diseased_true"],
-        y_pred=out["diseased_ensemble"],
-        age_bins=AGE_BINS,
-        model_name=MODEL_NAME,
-        save_path="./plots/diseased/Diseased_Group.png"
-    )
-
-    print("\nPlots saved to ./plots/")
