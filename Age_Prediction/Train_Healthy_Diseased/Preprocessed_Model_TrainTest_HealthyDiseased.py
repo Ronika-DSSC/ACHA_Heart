@@ -1283,18 +1283,7 @@ def run_full_experiment(
 # =====================================================================
 # MODEL ZOO
 MODELS = {
-    "XResNet1d18": lambda: xresnet1d18(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
-    "XResNet1d34": lambda: xresnet1d34(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
-    "XResNet1d50": lambda: xresnet1d50(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
-    "XResNet1d101": lambda: xresnet1d101(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
-    "XResNet1d152": lambda: xresnet1d152(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
-    "XResNet1d18_Deep": lambda: xresnet1d18_deep(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
-    "XResNet1d34_Deep": lambda: xresnet1d34_deep(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
-    "XResNet1d50_Deep": lambda: xresnet1d50_deep(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
-    "XResNet1d18_Deeper": lambda: xresnet1d18_deeper(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
-    "XResNet1d34_Deeper": lambda: xresnet1d34_deeper(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
     "XResNet1d50_Deeper": lambda: xresnet1d50_deeper(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
-    "Inception1d_Residual": lambda: inception1d(input_channels=NUM_CHANNELS, num_classes=NUM_OUTPUT),
 }
 
 if __name__ == "__main__":
